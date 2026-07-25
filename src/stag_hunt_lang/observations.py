@@ -31,7 +31,7 @@ def observation_vector_size(config: EnvConfig) -> int:
 def global_state_size(config: EnvConfig) -> int:
     """Return the width of ``StagHuntLanguageEnv.state()``."""
 
-    return 9 + 4 * config.n_stags + 2 * config.n_hares
+    return 11 + 4 * config.n_stags + 2 * config.n_hares
 
 
 def encode_observation(

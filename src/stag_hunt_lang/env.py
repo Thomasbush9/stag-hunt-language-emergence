@@ -78,6 +78,7 @@ class StagHuntLanguageEnv(ParallelEnv):
         self._last_moves: dict[AgentID, Move] = {
             agent: Move.STAY for agent in self.possible_agents
         }
+        self._commitments: dict[AgentID, int] = {}
         self._outcome = "not_reset"
         self._observation_spaces = {
             agent: self._make_observation_space() for agent in self.possible_agents
@@ -161,6 +162,7 @@ class StagHuntLanguageEnv(ParallelEnv):
         self._timestep = 0
         self._last_messages = {agent: 0 for agent in self.possible_agents}
         self._last_moves = {agent: Move.STAY for agent in self.possible_agents}
+        self._commitments = {}
         self._outcome = "ongoing"
 
         self._correct_color = self._sample_feature(
@@ -220,6 +222,12 @@ class StagHuntLanguageEnv(ParallelEnv):
             agent: self._parse_action(agent, actions[agent]) for agent in acting_agents
         }
 
+        # A committed agent holds its stag: movement and further interaction are
+        # ignored while its window is open, but its messages still go out.
+        for agent in self._commitments:
+            if agent in parsed_actions:
+                parsed_actions[agent] = (Move.STAY, parsed_actions[agent][1])
+
         for agent, (move, _) in parsed_actions.items():
             if move != Move.INTERACT:
                 self._agent_positions[agent] = self._moved_position(
@@ -272,6 +280,10 @@ class StagHuntLanguageEnv(ParallelEnv):
             np.asarray([self._correct_color, self._correct_region], dtype=np.int64),
             np.asarray(
                 [self._last_messages[agent] for agent in self.possible_agents],
+                dtype=np.int64,
+            ),
+            np.asarray(
+                [self._commitments.get(agent, 0) for agent in self.possible_agents],
                 dtype=np.int64,
             ),
             np.asarray([self._timestep], dtype=np.int64),
@@ -353,6 +365,11 @@ class StagHuntLanguageEnv(ParallelEnv):
             f"  {agent}: position={tuple(map(int, self._agent_positions[agent]))}, "
             f"last_move={self._last_moves[agent].name}, sent={self._last_messages[agent]}, "
             f"received={self._last_messages[self._other_agent(agent)]}"
+            + (
+                f", holding stag ({self._commitments[agent]} steps left)"
+                if agent in self._commitments
+                else ""
+            )
             for agent in self.possible_agents
         ]
         clue_lines = [
@@ -388,46 +405,71 @@ class StagHuntLanguageEnv(ParallelEnv):
     def _resolve_interactions(
         self, interactors: set[AgentID], rewards: dict[AgentID, float]
     ) -> bool:
-        if not interactors:
+        if not interactors and not self._commitments:
             return False
 
-        correct_position = self.correct_target_position
-        joint_stag = all(
-            agent in interactors
-            and np.array_equal(self._agent_positions[agent], correct_position)
-            for agent in self.possible_agents
-        )
-        if joint_stag:
-            for agent in self.possible_agents:
-                rewards[agent] += self.config.stag_reward
-            self._outcome = "joint_stag"
-            return True
-
-        committed = False
         hare_hunters: set[AgentID] = set()
         stag_hunters: set[AgentID] = set()
         for agent in interactors:
             position = self._agent_positions[agent]
             if self._position_in(position, self._hare_positions):
                 hare_hunters.add(agent)
-                committed = True
             elif self._position_in(position, self._stag_positions):
                 stag_hunters.add(agent)
-                committed = True
 
-        for agent in hare_hunters:
-            rewards[agent] += self.config.hare_reward
-        for agent in stag_hunters:
-            rewards[agent] += self.config.failed_stag_reward
+        # Agents present at a stag either by interacting now or by holding an
+        # open commitment there (their position is frozen at that stag).
+        presence: dict[tuple[int, int], set[AgentID]] = {}
+        for agent in stag_hunters | set(self._commitments):
+            cell = tuple(map(int, self._agent_positions[agent]))
+            presence.setdefault(cell, set()).add(agent)
 
-        if committed:
-            if hare_hunters and stag_hunters:
-                self._outcome = "hare_stag_mismatch"
-            elif hare_hunters:
-                self._outcome = "hare"
+        correct_cell = tuple(map(int, self.correct_target_position))
+        for cell, agents_present in presence.items():
+            if len(agents_present) < len(self.possible_agents):
+                continue
+            if cell == correct_cell:
+                for agent in self.possible_agents:
+                    rewards[agent] += self.config.stag_reward
+                self._outcome = "joint_stag"
             else:
+                for agent in self.possible_agents:
+                    rewards[agent] += self.config.failed_stag_reward
                 self._outcome = "failed_stag"
-        return committed
+            return True
+
+        if hare_hunters:
+            for agent in hare_hunters:
+                rewards[agent] += self.config.hare_reward
+            pending = (stag_hunters | set(self._commitments)) - hare_hunters
+            for agent in pending:
+                rewards[agent] += self.config.failed_stag_reward
+            self._outcome = "hare_stag_mismatch" if pending else "hare"
+            return True
+
+        if self.config.commit_window == 0:
+            if stag_hunters:
+                for agent in stag_hunters:
+                    rewards[agent] += self.config.failed_stag_reward
+                self._outcome = "failed_stag"
+                return True
+            return False
+
+        # Count down open windows; expiry makes every pending commitment fail.
+        expired = False
+        for agent in list(self._commitments):
+            self._commitments[agent] -= 1
+            if self._commitments[agent] <= 0:
+                expired = True
+        if expired:
+            for agent in set(self._commitments) | stag_hunters:
+                rewards[agent] += self.config.failed_stag_reward
+            self._outcome = "failed_stag"
+            return True
+
+        for agent in stag_hunters:
+            self._commitments[agent] = self.config.commit_window
+        return False
 
     def _observation(self, agent: AgentID) -> dict[str, Any]:
         other = self._other_agent(agent)

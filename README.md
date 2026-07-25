@@ -101,6 +101,26 @@ while env.agents:
 See [`docs/experiment.md`](docs/experiment.md) for the experimental contract and
 the next implementation milestones.
 
+## Training and analysis
+
+The exploratory MAPPO baseline lives in `scripts/`:
+
+```bash
+uv run python scripts/train_mappo.py --output-dir <run-dir> \
+    --updates 2000 --episodes-per-update 32 --seed 0 \
+    --curriculum-start 1.8 --curriculum-updates 1200   # risk curriculum (optional)
+uv run python scripts/plot_training.py --run-dir <run-dir>
+uv run python scripts/analyze_language.py --run-dir <run-dir>
+```
+
+`train_mappo.py` implements recurrent PPO with a parameter-sharing actor and
+per-agent centralized critics; the optional risk curriculum anneals
+`failed_stag_reward` from `--curriculum-start` to the default over
+`--curriculum-updates` updates. `analyze_language.py` measures MI between each
+agent's private clue and its messages and runs the mute/randomize channel
+interventions from the experimental contract. Results so far are documented in
+[`docs/experiments/2026-07-23-risk-curriculum.md`](docs/experiments/2026-07-23-risk-curriculum.md).
+
 ## Why EGG is not the core trainer
 
 [EGG](https://github.com/facebookresearch/EGG) remains highly relevant for its

@@ -22,6 +22,10 @@ class EnvConfig:
     failed_stag_reward: float = 0.0
     step_cost: float = 0.0
     observe_other_position: bool = True
+    # A stag INTERACT arms a commitment that stays open for commit_window
+    # subsequent steps, freezing the committer while the partner may join.
+    # 0 restores instant resolution (joint capture requires the same step).
+    commit_window: int = 0
 
     def __post_init__(self) -> None:
         if self.grid_size < 3:
@@ -36,6 +40,8 @@ class EnvConfig:
             raise ValueError("n_hares must be positive")
         if self.vocab_size < 1:
             raise ValueError("vocab_size must be positive")
+        if self.commit_window < 0:
+            raise ValueError("commit_window must be non-negative")
         if not self.stag_reward > self.hare_reward > self.failed_stag_reward:
             raise ValueError(
                 "payoffs must satisfy stag_reward > hare_reward > failed_stag_reward"

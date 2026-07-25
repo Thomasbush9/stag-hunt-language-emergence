@@ -133,5 +133,75 @@ def test_hidden_partner_position_removes_movement_signal() -> None:
     np.testing.assert_array_equal(observations["agent_1"]["other_position"], [-1, -1])
 
 
+def test_commit_window_lets_partner_join_late() -> None:
+    env = StagHuntLanguageEnv(EnvConfig(commit_window=3))
+    env.reset(seed=9)
+    target = env.correct_target_position
+    env._agent_positions = {agent: target.copy() for agent in env.possible_agents}
+
+    _, rewards, terminations, _, infos = env.step(
+        {"agent_0": action(Move.INTERACT), "agent_1": action(Move.STAY)}
+    )
+    assert rewards == {"agent_0": 0.0, "agent_1": 0.0}
+    assert not any(terminations.values())
+    assert infos["agent_0"]["outcome"] == "ongoing"
+
+    _, rewards, terminations, _, infos = env.step(
+        {"agent_0": action(Move.STAY), "agent_1": action(Move.INTERACT)}
+    )
+    assert rewards == {"agent_0": 4.0, "agent_1": 4.0}
+    assert all(terminations.values())
+    assert infos["agent_0"]["outcome"] == "joint_stag"
+
+
+def test_commit_window_freezes_the_committer() -> None:
+    env = StagHuntLanguageEnv(EnvConfig(commit_window=3))
+    env.reset(seed=10)
+    target = env.correct_target_position
+    env._agent_positions["agent_0"] = target.copy()
+
+    env.step({"agent_0": action(Move.INTERACT), "agent_1": action(Move.STAY)})
+    env.step({"agent_0": action(Move.LEFT), "agent_1": action(Move.STAY)})
+    np.testing.assert_array_equal(env.agent_positions["agent_0"], target)
+
+
+def test_commit_window_expiry_fails_the_committer() -> None:
+    env = StagHuntLanguageEnv(EnvConfig(commit_window=2))
+    env.reset(seed=11)
+    env._agent_positions["agent_0"] = env.correct_target_position
+
+    _, _, terminations, _, _ = env.step(
+        {"agent_0": action(Move.INTERACT), "agent_1": action(Move.STAY)}
+    )
+    assert not any(terminations.values())
+    _, _, terminations, _, _ = env.step(
+        {"agent_0": action(Move.STAY), "agent_1": action(Move.STAY)}
+    )
+    assert not any(terminations.values())
+
+    _, rewards, terminations, _, infos = env.step(
+        {"agent_0": action(Move.STAY), "agent_1": action(Move.STAY)}
+    )
+    assert rewards == {"agent_0": 0.0, "agent_1": 0.0}
+    assert all(terminations.values())
+    assert infos["agent_0"]["outcome"] == "failed_stag"
+
+
+def test_commit_window_messages_still_flow_while_holding() -> None:
+    env = StagHuntLanguageEnv(EnvConfig(commit_window=3))
+    env.reset(seed=12)
+    env._agent_positions["agent_0"] = env.correct_target_position
+
+    env.step({"agent_0": action(Move.INTERACT), "agent_1": action(Move.STAY)})
+    observations, _, _, _, _ = env.step(
+        {"agent_0": action(Move.STAY, message=4), "agent_1": action(Move.STAY)}
+    )
+    assert observations["agent_1"]["received_message"] == 4
+
+
 def test_parallel_environment_api() -> None:
     parallel_api_test(StagHuntLanguageEnv(), num_cycles=100)
+
+
+def test_parallel_environment_api_with_commit_window() -> None:
+    parallel_api_test(StagHuntLanguageEnv(EnvConfig(commit_window=3)), num_cycles=100)
