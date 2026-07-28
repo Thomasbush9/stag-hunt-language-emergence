@@ -516,6 +516,7 @@ def main() -> None:
     parser.add_argument("--n-colors", type=int, default=2)
     parser.add_argument("--n-regions", type=int, default=2)
     parser.add_argument("--vocab-size", type=int, default=4)
+    parser.add_argument("--init-checkpoint", type=Path, default=None)
     args = parser.parse_args()
 
     train_config = TrainConfig(
@@ -570,11 +571,27 @@ def main() -> None:
         lr=train_config.learning_rate,
     )
 
+    if args.init_checkpoint is not None:
+        state = torch.load(args.init_checkpoint, map_location=device, weights_only=True)
+        if "actors" in state:
+            for actor, actor_state in zip(dict.fromkeys(actors), state["actors"]):
+                actor.load_state_dict(actor_state)
+        else:
+            actors[0].load_state_dict(state["actor"])
+        critics.load_state_dict(state["critics"])
+        optimizer.load_state_dict(state["optimizer"])
+        print(f"warm-started from {args.init_checkpoint} (saved at update {state['update'] + 1})")
+
     run_dir = args.output_dir
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "config.json").write_text(
         json.dumps(
-            {"train": asdict(train_config), "env": asdict(env_config), "device": str(device)},
+            {
+                "train": asdict(train_config),
+                "env": asdict(env_config),
+                "device": str(device),
+                "init_checkpoint": str(args.init_checkpoint) if args.init_checkpoint else None,
+            },
             indent=2,
         )
     )
