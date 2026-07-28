@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -28,10 +29,79 @@ def observation_vector_size(config: EnvConfig) -> int:
     )
 
 
+def encode_observation_np(observation: Mapping[str, Any], config: EnvConfig) -> "np.ndarray":
+    """NumPy twin of :func:`encode_observation` for fast CPU-side collection.
+
+    Must stay field-for-field identical to the torch encoder; the test suite
+    asserts exact equality.
+    """
+
+    agent_id = np.zeros(2, dtype=np.float32)
+    agent_id[int(observation["agent_id"])] = 1.0
+    grid = config.grid_size - 1
+    self_position = np.asarray(observation["self_position"], dtype=np.float32) / grid
+    other_position = np.asarray(observation["other_position"], dtype=np.float32) / grid
+    stag_positions = np.asarray(observation["stag_positions"], dtype=np.float32).ravel() / grid
+    feature_scale = np.asarray(
+        [config.n_colors - 1, config.n_regions - 1], dtype=np.float32
+    )
+    stag_features = (
+        np.asarray(observation["stag_features"], dtype=np.float32) / feature_scale
+    ).ravel()
+    hare_positions = np.asarray(observation["hare_positions"], dtype=np.float32).ravel() / grid
+    clue_scale = np.asarray([config.n_colors, config.n_regions], dtype=np.float32)
+    private_clue = np.asarray(observation["private_clue"], dtype=np.float32) / clue_scale
+    received = np.zeros(config.vocab_size + 1, dtype=np.float32)
+    received[int(observation["received_message"])] = 1.0
+    timestep = np.asarray(
+        [float(observation["timestep"]) / config.horizon], dtype=np.float32
+    )
+
+    encoded = np.concatenate(
+        [
+            agent_id,
+            self_position,
+            other_position,
+            stag_positions,
+            stag_features,
+            hare_positions,
+            private_clue,
+            received,
+            timestep,
+        ]
+    )
+    if encoded.shape != (observation_vector_size(config),):
+        raise RuntimeError(f"encoded observation has shape {encoded.shape}")
+    return encoded
+
+
+def received_message_slice(config: EnvConfig) -> slice:
+    """Locate the received-message one-hot inside the encoded observation."""
+
+    start = (
+        len(("agent_0", "agent_1"))
+        + 2
+        + 2
+        + config.n_stags * 2
+        + config.n_stags * 2
+        + config.n_hares * 2
+        + 2
+    )
+    stop = start + config.vocab_size + 1
+    if stop + 1 != observation_vector_size(config):
+        raise RuntimeError("received_message_slice is out of sync with encode_observation")
+    return slice(start, stop)
+
+
 def global_state_size(config: EnvConfig) -> int:
     """Return the width of ``StagHuntLanguageEnv.state()``."""
 
-    return 11 + 4 * config.n_stags + 2 * config.n_hares
+    return (
+        11
+        + 4 * config.n_stags
+        + 2 * config.n_hares
+        + (1 if config.randomize_clue_assignment else 0)
+    )
 
 
 def encode_observation(

@@ -26,6 +26,25 @@ class EnvConfig:
     # subsequent steps, freezing the committer while the partner may join.
     # 0 restores instant resolution (joint capture requires the same step).
     commit_window: int = 0
+    # "interact": captures require the INTERACT action (original semantics).
+    # "presence": standing is enough — both agents on the correct stag cell
+    # capture it (terminal); joint presence on a wrong stag is a non-terminal
+    # no-op, and a single agent on a hare cell captures it. INTERACT becomes
+    # a no-op and commit_window must stay 0.
+    capture_mode: str = "interact"
+    # Sticky channel: the partner's most recent NON-SILENT symbol persists in
+    # received_message instead of being overwritten every step. Fights credit
+    # dilution — one good symbol keeps informing the listener all episode.
+    sticky_messages: bool = False
+    # Talk-then-hunt: for the first talk_phase_steps steps, movement and all
+    # capture resolution are frozen; only messages flow. Concentrates message
+    # credit at the episode start. 0 disables.
+    talk_phase_steps: int = 0
+    # Randomize which agent holds the color clue each episode (the partner
+    # always holds the region clue). The private_clue slot layout already
+    # marks the held attribute, so no observation format change is needed.
+    # Forces every agent to learn all four speak/decode mappings.
+    randomize_clue_assignment: bool = False
 
     def __post_init__(self) -> None:
         if self.grid_size < 3:
@@ -36,13 +55,21 @@ class EnvConfig:
             raise ValueError("n_colors and n_regions must both be at least 2")
         if self.n_regions > self.grid_size:
             raise ValueError("n_regions cannot exceed grid_size")
-        if self.n_hares < 1:
-            raise ValueError("n_hares must be positive")
+        if self.n_hares < 0:
+            raise ValueError("n_hares must be non-negative")
         if self.vocab_size < 1:
             raise ValueError("vocab_size must be positive")
         if self.commit_window < 0:
             raise ValueError("commit_window must be non-negative")
-        if not self.stag_reward > self.hare_reward > self.failed_stag_reward:
+        if self.capture_mode not in ("interact", "presence"):
+            raise ValueError("capture_mode must be 'interact' or 'presence'")
+        if self.capture_mode == "presence" and self.commit_window != 0:
+            raise ValueError("commit_window is only meaningful with capture_mode='interact'")
+        if not 0 <= self.talk_phase_steps < self.horizon:
+            raise ValueError("talk_phase_steps must be in [0, horizon)")
+        if not self.stag_reward > self.failed_stag_reward:
+            raise ValueError("payoffs must satisfy stag_reward > failed_stag_reward")
+        if self.n_hares > 0 and not self.stag_reward > self.hare_reward > self.failed_stag_reward:
             raise ValueError(
                 "payoffs must satisfy stag_reward > hare_reward > failed_stag_reward"
             )

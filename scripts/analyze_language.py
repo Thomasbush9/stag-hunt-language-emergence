@@ -19,7 +19,7 @@ import torch
 
 from stag_hunt_lang import EnvConfig, StagHuntLanguageEnv
 from stag_hunt_lang.device import resolve_torch_device
-from stag_hunt_lang.models import RecurrentActor, actions_for_env
+from stag_hunt_lang.models import RecurrentActor
 from stag_hunt_lang.observations import batch_observations
 
 AGENTS = ("agent_0", "agent_1")
@@ -30,13 +30,22 @@ GRID = "#e6e5e0"
 OUTCOMES = ["joint_stag", "hare", "failed_stag", "timeout", "hare_stag_mismatch"]
 
 
-def load_actor(path: Path, env_config: EnvConfig, device: torch.device) -> RecurrentActor:
+def load_actors(path: Path, env_config: EnvConfig, device: torch.device) -> list[RecurrentActor]:
+    """Return one actor per agent; shared-weight checkpoints yield the same instance twice."""
+
     checkpoint = torch.load(path, map_location=device, weights_only=True)
     hidden_size = checkpoint["train_config"]["hidden_size"]
-    actor = RecurrentActor(env_config, hidden_size=hidden_size).to(device)
-    actor.load_state_dict(checkpoint["actor"])
-    actor.eval()
-    return actor
+
+    def build(state_dict: dict) -> RecurrentActor:
+        actor = RecurrentActor(env_config, hidden_size=hidden_size).to(device)
+        actor.load_state_dict(state_dict)
+        actor.eval()
+        return actor
+
+    if "actors" in checkpoint:
+        return [build(state) for state in checkpoint["actors"]]
+    shared = build(checkpoint["actor"])
+    return [shared, shared]
 
 
 def load_env_config(path: Path, device: torch.device) -> EnvConfig:
@@ -49,7 +58,7 @@ def load_env_config(path: Path, device: torch.device) -> EnvConfig:
 
 
 def run_eval(
-    actor: RecurrentActor,
+    actors: list[RecurrentActor],
     env_config: EnvConfig,
     device: torch.device,
     episodes: int,
@@ -61,15 +70,17 @@ def run_eval(
 
     env = StagHuntLanguageEnv(env_config)
     outcomes: Counter[str] = Counter()
+    first_presences: Counter[str] = Counter()
     returns = np.zeros((episodes, 2))
-    # message counts conditioned on the sender's private clue
+    # message counts conditioned on the attribute its holder privately sees
     color_message = np.zeros((env_config.n_colors, env_config.vocab_size + 1))
     region_message = np.zeros((env_config.n_regions, env_config.vocab_size + 1))
 
     for episode in range(episodes):
         observations, _ = env.reset(seed=seed_base + episode)
         color, region = env.correct_color, env.correct_region
-        hidden = actor.initial_state(len(AGENTS), device=device)
+        color_index = AGENTS.index(env.color_holder)
+        hiddens = [actor.initial_state(1, device=device) for actor in actors]
 
         while env.agents:
             if intervention == "muted":
@@ -81,20 +92,34 @@ def run_eval(
                         rng.integers(env_config.vocab_size + 1)
                     )
             encoded = batch_observations(observations, list(AGENTS), env_config, device=device)
+            messages, actions = [], {}
             with torch.no_grad():
-                output = actor.act(encoded, hidden)
-            hidden = output.hidden
-            observations, rewards, _, _, _ = env.step(actions_for_env(output, list(AGENTS)))
+                for index, agent in enumerate(AGENTS):
+                    output = actors[index].act(encoded[index : index + 1], hiddens[index])
+                    hiddens[index] = output.hidden
+                    actions[agent] = {
+                        "move": int(output.move.item()),
+                        "message": int(output.message.item()),
+                    }
+                    messages.append(int(output.message.item()))
+            observations, rewards, _, _, _ = env.step(actions)
 
-            color_message[color, int(output.message[0].item())] += 1
-            region_message[region, int(output.message[1].item())] += 1
+            color_message[color, messages[color_index]] += 1
+            region_message[region, messages[1 - color_index]] += 1
             for index, agent in enumerate(AGENTS):
                 returns[episode, index] += rewards[agent]
 
         outcomes[env.outcome] += 1
+        if env.first_joint_presence is not None:
+            first_presences[env.first_joint_presence] += 1
 
+    attempted = sum(first_presences.values())
     return {
         "outcomes": dict(outcomes),
+        "first_presence_counts": dict(first_presences),
+        "first_presence_accuracy": (
+            first_presences.get("correct", 0) / attempted if attempted else None
+        ),
         "mean_return_agent_0": float(returns[:, 0].mean()),
         "mean_return_agent_1": float(returns[:, 1].mean()),
         "color_message": color_message,
@@ -167,27 +192,32 @@ def main() -> None:
     # MI trajectory across checkpoints (intact channel)
     mi_by_checkpoint = []
     for path in checkpoints:
-        actor = load_actor(path, env_config, device)
-        result = run_eval(actor, env_config, device, args.episodes, args.seed, "none", rng)
+        actors = load_actors(path, env_config, device)
+        result = run_eval(actors, env_config, device, args.episodes, args.seed, "none", rng)
         mi_by_checkpoint.append(
             {
                 "checkpoint": path.stem,
-                "mi_color_agent0": mutual_information(result["color_message"]),
-                "mi_region_agent1": mutual_information(result["region_message"]),
+                "mi_color": mutual_information(result["color_message"]),
+                "mi_region": mutual_information(result["region_message"]),
             }
         )
         print(f"{path.stem}: {mi_by_checkpoint[-1]}")
 
     # interventions on the final checkpoint
-    actor = load_actor(checkpoints[-1], env_config, device)
+    actors = load_actors(checkpoints[-1], env_config, device)
     conditions = {}
     for intervention in ("none", "muted", "random"):
         conditions[intervention] = run_eval(
-            actor, env_config, device, args.episodes, args.seed, intervention, rng
+            actors, env_config, device, args.episodes, args.seed, intervention, rng
         )
         summary = {
             key: conditions[intervention][key]
-            for key in ("outcomes", "mean_return_agent_0", "mean_return_agent_1")
+            for key in (
+                "outcomes",
+                "mean_return_agent_0",
+                "mean_return_agent_1",
+                "first_presence_accuracy",
+            )
         }
         print(f"intervention={intervention}: {summary}")
 
@@ -205,6 +235,8 @@ def main() -> None:
                 "outcomes": result["outcomes"],
                 "mean_return_agent_0": result["mean_return_agent_0"],
                 "mean_return_agent_1": result["mean_return_agent_1"],
+                "first_presence_counts": result["first_presence_counts"],
+                "first_presence_accuracy": result["first_presence_accuracy"],
             }
             for name, result in conditions.items()
         },
@@ -231,7 +263,7 @@ def main() -> None:
     steps = [int(entry["checkpoint"].split("_")[1]) for entry in mi_by_checkpoint]
     ax.plot(
         steps,
-        [entry["mi_color_agent0"] for entry in mi_by_checkpoint],
+        [entry["mi_color"] for entry in mi_by_checkpoint],
         color=SERIES[0],
         linewidth=2,
         marker="o",
@@ -240,7 +272,7 @@ def main() -> None:
     )
     ax.plot(
         steps,
-        [entry["mi_region_agent1"] for entry in mi_by_checkpoint],
+        [entry["mi_region"] for entry in mi_by_checkpoint],
         color=SERIES[1],
         linewidth=2,
         marker="o",

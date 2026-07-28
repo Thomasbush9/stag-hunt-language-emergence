@@ -75,11 +75,15 @@ class StagHuntLanguageEnv(ParallelEnv):
         self._correct_region = 0
         self._correct_target_index = 0
         self._last_messages: dict[AgentID, int] = {agent: 0 for agent in self.possible_agents}
+        self._sticky_sent: dict[AgentID, int] = {agent: 0 for agent in self.possible_agents}
         self._last_moves: dict[AgentID, Move] = {
             agent: Move.STAY for agent in self.possible_agents
         }
         self._commitments: dict[AgentID, int] = {}
         self._outcome = "not_reset"
+        self._first_joint_presence: str | None = None
+        self._wrong_presence_steps = 0
+        self._color_holder: AgentID = "agent_0"
         self._observation_spaces = {
             agent: self._make_observation_space() for agent in self.possible_agents
         }
@@ -161,9 +165,16 @@ class StagHuntLanguageEnv(ParallelEnv):
         self.agents = self.possible_agents.copy()
         self._timestep = 0
         self._last_messages = {agent: 0 for agent in self.possible_agents}
+        self._sticky_sent = {agent: 0 for agent in self.possible_agents}
         self._last_moves = {agent: Move.STAY for agent in self.possible_agents}
         self._commitments = {}
         self._outcome = "ongoing"
+        self._first_joint_presence = None
+        self._wrong_presence_steps = 0
+        if self.config.randomize_clue_assignment:
+            self._color_holder = self.possible_agents[int(self.np_random.integers(2))]
+        else:
+            self._color_holder = "agent_0"
 
         self._correct_color = self._sample_feature(
             options.get("correct_color"), self.config.n_colors, "correct_color"
@@ -228,24 +239,36 @@ class StagHuntLanguageEnv(ParallelEnv):
             if agent in parsed_actions:
                 parsed_actions[agent] = (Move.STAY, parsed_actions[agent][1])
 
-        for agent, (move, _) in parsed_actions.items():
-            if move != Move.INTERACT:
-                self._agent_positions[agent] = self._moved_position(
-                    self._agent_positions[agent], move
-                )
+        # During the talk phase only messages flow: no movement, no captures.
+        in_talk_phase = self._timestep < self.config.talk_phase_steps
+
+        if not in_talk_phase:
+            for agent, (move, _) in parsed_actions.items():
+                if move != Move.INTERACT:
+                    self._agent_positions[agent] = self._moved_position(
+                        self._agent_positions[agent], move
+                    )
 
         rewards = {agent: float(self.config.step_cost) for agent in acting_agents}
         terminations = {agent: False for agent in acting_agents}
         truncations = {agent: False for agent in acting_agents}
 
-        interactors = {
-            agent for agent, (move, _) in parsed_actions.items() if move == Move.INTERACT
-        }
-        episode_ended = self._resolve_interactions(interactors, rewards)
+        if in_talk_phase:
+            episode_ended = False
+        elif self.config.capture_mode == "presence":
+            episode_ended = self._resolve_presence(rewards)
+        else:
+            interactors = {
+                agent for agent, (move, _) in parsed_actions.items() if move == Move.INTERACT
+            }
+            episode_ended = self._resolve_interactions(interactors, rewards)
 
         self._last_messages = {
             agent: message for agent, (_, message) in parsed_actions.items()
         }
+        for agent, (_, message) in parsed_actions.items():
+            if message != 0:
+                self._sticky_sent[agent] = message
         self._last_moves = {agent: move for agent, (move, _) in parsed_actions.items()}
         self._timestep += 1
 
@@ -288,6 +311,10 @@ class StagHuntLanguageEnv(ParallelEnv):
             ),
             np.asarray([self._timestep], dtype=np.int64),
         ]
+        if self.config.randomize_clue_assignment:
+            components.append(
+                np.asarray([self.possible_agents.index(self._color_holder)], dtype=np.int64)
+            )
         return np.concatenate(components).astype(np.float32)
 
     @property
@@ -327,6 +354,22 @@ class StagHuntLanguageEnv(ParallelEnv):
     @property
     def outcome(self) -> str:
         return self._outcome
+
+    @property
+    def color_holder(self) -> AgentID:
+        """Which agent privately sees the colour clue this episode."""
+
+        return self._color_holder
+
+    @property
+    def first_joint_presence(self) -> str | None:
+        """"correct"/"wrong" for the first joint stag presence, None if never."""
+
+        return self._first_joint_presence
+
+    @property
+    def wrong_presence_steps(self) -> int:
+        return self._wrong_presence_steps
 
     def render(self) -> str:
         grid: list[list[list[str]]] = [
@@ -372,9 +415,10 @@ class StagHuntLanguageEnv(ParallelEnv):
             )
             for agent in self.possible_agents
         ]
+        region_holder = self._other_agent(self._color_holder)
         clue_lines = [
-            f"  agent_0 privately sees color={self._color_name(self._correct_color)}",
-            f"  agent_1 privately sees region={self._region_name(self._correct_region)}",
+            f"  {self._color_holder} privately sees color={self._color_name(self._correct_color)}",
+            f"  {region_holder} privately sees region={self._region_name(self._correct_region)}",
         ]
 
         return "\n".join(
@@ -401,6 +445,49 @@ class StagHuntLanguageEnv(ParallelEnv):
 
     def close(self) -> None:
         return None
+
+    def _resolve_presence(self, rewards: dict[AgentID, float]) -> bool:
+        """Position-based resolution: standing on a cell is the commitment.
+
+        A single agent on a hare cell captures it (terminal). Both agents on
+        the correct stag cell capture it (terminal). Both agents on a wrong
+        stag cell is non-terminal: they receive failed_stag_reward per step
+        (0 by default) and the event feeds the targeting-accuracy diagnostic.
+        Solo presence on any stag does nothing.
+        """
+
+        hare_hunters = {
+            agent
+            for agent, position in self._agent_positions.items()
+            if self._position_in(position, self._hare_positions)
+        }
+        if hare_hunters:
+            for agent in hare_hunters:
+                rewards[agent] += self.config.hare_reward
+            self._outcome = "hare"
+            return True
+
+        positions = [self._agent_positions[agent] for agent in self.possible_agents]
+        if not all(np.array_equal(positions[0], later) for later in positions[1:]):
+            return False
+        shared_cell = positions[0]
+        if not self._position_in(shared_cell, self._stag_positions):
+            return False
+
+        if np.array_equal(shared_cell, self.correct_target_position):
+            if self._first_joint_presence is None:
+                self._first_joint_presence = "correct"
+            for agent in self.possible_agents:
+                rewards[agent] += self.config.stag_reward
+            self._outcome = "joint_stag"
+            return True
+
+        if self._first_joint_presence is None:
+            self._first_joint_presence = "wrong"
+        self._wrong_presence_steps += 1
+        for agent in self.possible_agents:
+            rewards[agent] += self.config.failed_stag_reward
+        return False
 
     def _resolve_interactions(
         self, interactors: set[AgentID], rewards: dict[AgentID, float]
@@ -478,7 +565,7 @@ class StagHuntLanguageEnv(ParallelEnv):
             if self.config.observe_other_position
             else np.asarray([-1, -1], dtype=np.int64)
         )
-        if agent == "agent_0":
+        if agent == self._color_holder:
             private_clue = np.asarray([self._correct_color + 1, 0], dtype=np.int64)
         else:
             private_clue = np.asarray([0, self._correct_region + 1], dtype=np.int64)
@@ -491,12 +578,22 @@ class StagHuntLanguageEnv(ParallelEnv):
             "stag_features": self._stag_features.copy(),
             "hare_positions": self._hare_positions.copy(),
             "private_clue": private_clue,
-            "received_message": self._last_messages[other],
+            "received_message": (
+                self._sticky_sent[other]
+                if self.config.sticky_messages
+                else self._last_messages[other]
+            ),
             "timestep": self._timestep,
         }
 
     def _info(self, agent: AgentID) -> dict[str, Any]:
-        return {"outcome": self._outcome, "agent": agent}
+        return {
+            "outcome": self._outcome,
+            "agent": agent,
+            "first_joint_presence": self._first_joint_presence,
+            "wrong_presence_steps": self._wrong_presence_steps,
+            "color_holder": self._color_holder,
+        }
 
     def _parse_action(self, agent: AgentID, action: dict[str, int]) -> tuple[Move, int]:
         if not self.action_space(agent).contains(action):

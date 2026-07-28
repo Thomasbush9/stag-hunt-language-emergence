@@ -21,8 +21,8 @@ from torch import nn
 
 from stag_hunt_lang import EnvConfig, StagHuntLanguageEnv
 from stag_hunt_lang.device import resolve_torch_device
-from stag_hunt_lang.models import CentralizedCritic, RecurrentActor, actions_for_env
-from stag_hunt_lang.observations import batch_observations
+from stag_hunt_lang.models import CentralizedCritic, RecurrentActor
+from stag_hunt_lang.observations import encode_observation_np, received_message_slice
 
 AGENTS = ("agent_0", "agent_1")
 
@@ -58,6 +58,15 @@ class TrainConfig:
     # "ppo" (clipped surrogate, GAE, critics) or "reinforce" (single epoch,
     # discounted return-to-go with whitening baseline, critics unused).
     algo: str = "ppo"
+    # Positive-signaling bias: adds -coef * MI(private clue; message policy)
+    # per speaker role, estimated from the batch. 0 disables.
+    signaling_coef: float = 0.0
+    # Positive-listening bias: adds -coef * L1(move policy | real messages,
+    # move policy | muted messages), pushing the listener to attend to the
+    # channel. Costs one extra BPTT forward per epoch. 0 disables.
+    listening_coef: float = 0.0
+    # Decoupled agents: one RecurrentActor per agent instead of shared weights.
+    separate_actors: bool = False
 
 
 @dataclass(slots=True)
@@ -73,72 +82,143 @@ class EpisodeBuffer:
     bootstrap_value: torch.Tensor  # [2] value of final state (0 if terminated)
     outcome: str
     length: int
+    # Presence-mode targeting diagnostics ("correct"/"wrong"/None, step count).
+    first_joint_presence: str | None
+    wrong_presence_steps: int
+    clue: torch.Tensor  # [2] episode clue: (correct color, correct region)
+    color_holder: int  # agent index privately holding the color clue
 
 
-def collect_episode(
-    env: StagHuntLanguageEnv,
-    actor: RecurrentActor,
+def collect_batch(
+    envs: list[StagHuntLanguageEnv],
+    actors: list[RecurrentActor],
     critics: nn.ModuleList,
     config: EnvConfig,
     device: torch.device,
-    seed: int | None,
+    seeds: list[int],
     proximity_bonus: float = 0.0,
-) -> EpisodeBuffer:
-    observations, _ = env.reset(seed=seed)
-    hidden = actor.initial_state(len(AGENTS), device=device)
+) -> list[EpisodeBuffer]:
+    """Collect one episode per env, stepping all envs in lockstep.
 
-    obs_steps, state_steps, move_steps, message_steps = [], [], [], []
-    log_prob_steps, reward_steps = [], []
+    The policy runs one batched forward per agent per timestep (instead of a
+    batch-1 call per env), observations are encoded in NumPy with a single
+    host-to-device transfer per step, and actions come back with a single
+    device-to-host sync per step. Buffers are returned on the CPU;
+    ``pad_episodes`` moves them to the device.
+    """
 
-    truncated = False
-    while env.agents:
-        encoded = batch_observations(observations, list(AGENTS), config, device=device)
-        state = torch.as_tensor(env.state(), dtype=torch.float32, device=device)
+    n = len(envs)
+    observations: list[dict] = []
+    for env, seed in zip(envs, seeds, strict=True):
+        obs, _ = env.reset(seed=seed)
+        observations.append(obs)
+
+    hidden = [actor.initial_state(n, device=device) for actor in actors]
+    steps: list[dict[str, list]] = [
+        {"obs": [], "state": [], "move": [], "message": [], "logp": [], "reward": []}
+        for _ in range(n)
+    ]
+    active = list(range(n))
+    truncated: set[int] = set()
+
+    while active:
+        encoded_np = np.stack(
+            [
+                np.stack(
+                    [
+                        encode_observation_np(observations[index][agent], config)
+                        for agent in AGENTS
+                    ]
+                )
+                for index in active
+            ]
+        )  # [n_active, 2, obs_dim]
+        states_np = np.stack([envs[index].state() for index in active])
+        encoded = torch.from_numpy(encoded_np).to(device)
+        rows = torch.as_tensor(active, device=device)
+
+        agent_moves, agent_messages, agent_log_probs = [], [], []
         with torch.no_grad():
-            output = actor.act(encoded, hidden)
-        hidden = output.hidden
+            for agent_index, actor in enumerate(actors):
+                output = actor.act(encoded[:, agent_index], hidden[agent_index][rows])
+                hidden[agent_index][rows] = output.hidden
+                agent_moves.append(output.move)
+                agent_messages.append(output.message)
+                agent_log_probs.append(output.log_prob)
+        moves = torch.stack(agent_moves, dim=1).cpu().numpy()  # [n_active, 2]
+        messages = torch.stack(agent_messages, dim=1).cpu().numpy()
+        log_probs = torch.stack(agent_log_probs, dim=1).cpu()
 
-        observations, rewards, _, truncations, _ = env.step(
-            actions_for_env(output, list(AGENTS))
-        )
-        truncated = any(truncations.values())
+        still_active = []
+        for row, index in enumerate(active):
+            env = envs[index]
+            observations[index], rewards, _, truncations, _ = env.step(
+                {
+                    agent: {
+                        "move": int(moves[row, agent_index]),
+                        "message": int(messages[row, agent_index]),
+                    }
+                    for agent_index, agent in enumerate(AGENTS)
+                }
+            )
 
-        if proximity_bonus > 0.0:
-            target = env.correct_target_position
-            if all(
-                np.abs(position - target).max() <= 1
-                for position in env.agent_positions.values()
-            ):
-                for agent in AGENTS:
-                    rewards[agent] += proximity_bonus
+            if proximity_bonus > 0.0:
+                target = env.correct_target_position
+                if all(
+                    np.abs(position - target).max() <= 1
+                    for position in env.agent_positions.values()
+                ):
+                    for agent in AGENTS:
+                        rewards[agent] += proximity_bonus
 
-        obs_steps.append(encoded)
-        state_steps.append(state)
-        move_steps.append(output.move)
-        message_steps.append(output.message)
-        log_prob_steps.append(output.log_prob)
-        reward_steps.append(
-            torch.tensor([rewards[agent] for agent in AGENTS], dtype=torch.float32, device=device)
-        )
+            record = steps[index]
+            record["obs"].append(encoded_np[row])
+            record["state"].append(states_np[row])
+            record["move"].append(moves[row])
+            record["message"].append(messages[row])
+            record["logp"].append(log_probs[row])
+            record["reward"].append([rewards[agent] for agent in AGENTS])
 
+            if env.agents:
+                still_active.append(index)
+            elif any(truncations.values()):
+                truncated.add(index)
+        active = still_active
+
+    bootstraps = {index: torch.zeros(len(AGENTS)) for index in range(n)}
     if truncated:
-        final_state = torch.as_tensor(env.state(), dtype=torch.float32, device=device)
+        order = sorted(truncated)
+        finals = torch.as_tensor(
+            np.stack([envs[index].state() for index in order]),
+            dtype=torch.float32,
+            device=device,
+        )
         with torch.no_grad():
-            bootstrap = torch.stack([critic(final_state) for critic in critics])
-    else:
-        bootstrap = torch.zeros(len(AGENTS), device=device)
+            values = torch.stack([critic(finals) for critic in critics], dim=-1).cpu()
+        for row, index in enumerate(order):
+            bootstraps[index] = values[row]
 
-    return EpisodeBuffer(
-        observations=torch.stack(obs_steps),
-        states=torch.stack(state_steps),
-        moves=torch.stack(move_steps),
-        messages=torch.stack(message_steps),
-        log_probs=torch.stack(log_prob_steps),
-        rewards=torch.stack(reward_steps),
-        bootstrap_value=bootstrap,
-        outcome=env.outcome,
-        length=len(obs_steps),
-    )
+    episodes = []
+    for index, env in enumerate(envs):
+        record = steps[index]
+        episodes.append(
+            EpisodeBuffer(
+                observations=torch.from_numpy(np.stack(record["obs"])),
+                states=torch.from_numpy(np.stack(record["state"])),
+                moves=torch.as_tensor(np.stack(record["move"]), dtype=torch.long),
+                messages=torch.as_tensor(np.stack(record["message"]), dtype=torch.long),
+                log_probs=torch.stack(record["logp"]),
+                rewards=torch.as_tensor(record["reward"], dtype=torch.float32),
+                bootstrap_value=bootstraps[index],
+                outcome=env.outcome,
+                length=len(record["obs"]),
+                first_joint_presence=env.first_joint_presence,
+                wrong_presence_steps=env.wrong_presence_steps,
+                clue=torch.tensor([env.correct_color, env.correct_region], dtype=torch.long),
+                color_holder=AGENTS.index(env.color_holder),
+            )
+        )
+    return episodes
 
 
 def pad_episodes(
@@ -158,6 +238,8 @@ def pad_episodes(
         "rewards": torch.zeros(batch, max_len, 2, device=device),
         "mask": torch.zeros(batch, max_len, device=device),
         "bootstrap": torch.zeros(batch, 2, device=device),
+        "clues": torch.zeros(batch, 2, dtype=torch.long, device=device),
+        "color_holder": torch.zeros(batch, dtype=torch.long, device=device),
     }
     for index, episode in enumerate(episodes):
         length = episode.length
@@ -169,6 +251,8 @@ def pad_episodes(
         out["rewards"][index, :length] = episode.rewards
         out["mask"][index, :length] = 1.0
         out["bootstrap"][index] = episode.bootstrap_value
+        out["clues"][index] = episode.clue
+        out["color_holder"][index] = episode.color_holder
     return out
 
 
@@ -210,41 +294,87 @@ def compute_returns_to_go(
 
 
 def sequence_forward(
-    actor: RecurrentActor,
+    actors: list[RecurrentActor],
     observations: torch.Tensor,  # [B, T, 2, obs_dim]
     moves: torch.Tensor,
     messages: torch.Tensor,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Re-run the GRU over full sequences; agents folded into the batch."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Re-run the GRUs over full sequences, one pass per agent.
+
+    Returns per-step log-probs and head entropies [B, T, 2] plus the full
+    move/message probability tensors [B, T, 2, n_actions] for the
+    communication bias losses. With shared weights the two passes are
+    mathematically identical to folding both agents into one batch.
+    """
 
     batch, horizon = observations.shape[:2]
-    flat_obs = observations.permute(0, 2, 1, 3).reshape(batch * 2, horizon, -1)
-    flat_moves = moves.permute(0, 2, 1).reshape(batch * 2, horizon)
-    flat_messages = messages.permute(0, 2, 1).reshape(batch * 2, horizon)
+    per_agent: list[list[list[torch.Tensor]]] = []
+    for index, actor in enumerate(actors):
+        agent_obs = observations[:, :, index, :]
+        agent_moves = moves[:, :, index]
+        agent_messages = messages[:, :, index]
+        hidden = actor.initial_state(batch, device=device)
+        steps: list[list[torch.Tensor]] = [[], [], [], [], []]
+        for t in range(horizon):
+            move_dist, message_dist, hidden = actor.distributions(agent_obs[:, t], hidden)
+            steps[0].append(
+                move_dist.log_prob(agent_moves[:, t])
+                + message_dist.log_prob(agent_messages[:, t])
+            )
+            steps[1].append(move_dist.entropy())
+            steps[2].append(message_dist.entropy())
+            steps[3].append(move_dist.probs)
+            steps[4].append(message_dist.probs)
+        per_agent.append(steps)
 
-    hidden = actor.initial_state(batch * 2, device=device)
-    log_probs, move_entropies, message_entropies = [], [], []
-    for t in range(horizon):
-        move_dist, message_dist, hidden = actor.distributions(flat_obs[:, t], hidden)
-        log_probs.append(
-            move_dist.log_prob(flat_moves[:, t]) + message_dist.log_prob(flat_messages[:, t])
-        )
-        move_entropies.append(move_dist.entropy())
-        message_entropies.append(message_dist.entropy())
+    def stack(slot: int) -> torch.Tensor:
+        # [B, T] per agent -> [B, T, 2]; [B, T, n] per agent -> [B, T, 2, n]
+        agent_tensors = [torch.stack(agent[slot], dim=1) for agent in per_agent]
+        return torch.stack(agent_tensors, dim=2)
 
-    def to_sequence(steps: list[torch.Tensor]) -> torch.Tensor:
-        return torch.stack(steps, dim=1).reshape(batch, 2, horizon).permute(0, 2, 1)
+    return stack(0), stack(1), stack(2), stack(3), stack(4)
 
-    return to_sequence(log_probs), to_sequence(move_entropies), to_sequence(message_entropies)
+
+def clue_message_mi(
+    probs: torch.Tensor,  # [B, T, vocab+1] — message policy of the attribute holder
+    values: torch.Tensor,  # [B] attribute value per episode
+    mask: torch.Tensor,  # [B, T]
+    n_values: int,
+) -> torch.Tensor:
+    """Batch estimate of MI(held attribute; message policy) for one attribute.
+
+    MI = H(marginal message dist) - sum_c w_c H(message dist | value = c),
+    computed from the policy's step-wise probabilities (differentiable).
+    """
+
+    eps = 1e-8
+    weights = mask.unsqueeze(-1)
+    total = mask.sum().clamp_min(1.0)
+
+    marginal = (probs * weights).sum(dim=(0, 1)) / total
+    marginal_entropy = -(marginal * (marginal + eps).log()).sum()
+
+    conditional_entropy = torch.zeros((), device=probs.device)
+    for value in range(n_values):
+        selected = (values == value).float().unsqueeze(1) * mask  # [B, T]
+        count = selected.sum()
+        if count.item() == 0:
+            continue
+        conditional = (probs * selected.unsqueeze(-1)).sum(dim=(0, 1)) / count
+        entropy = -(conditional * (conditional + eps).log()).sum()
+        conditional_entropy = conditional_entropy + (count / total) * entropy
+
+    return marginal_entropy - conditional_entropy
 
 
 def ppo_update(
-    actor: RecurrentActor,
+    actors: list[RecurrentActor],
     critics: nn.ModuleList,
     optimizer: torch.optim.Optimizer,
     batch: dict[str, torch.Tensor],
     train_config: TrainConfig,
+    env_config: EnvConfig,
     device: torch.device,
 ) -> dict[str, float]:
     mask = batch["mask"]
@@ -280,9 +410,10 @@ def ppo_update(
 
     epochs = 1 if train_config.algo == "reinforce" else train_config.ppo_epochs
     totals: Counter[str] = Counter()
+    message_slice = received_message_slice(env_config)
     for _ in range(epochs):
-        log_probs, move_entropy, message_entropy = sequence_forward(
-            actor, batch["observations"], batch["moves"], batch["messages"], device
+        log_probs, move_entropy, message_entropy, move_probs, message_probs = sequence_forward(
+            actors, batch["observations"], batch["moves"], batch["messages"], device
         )
         if train_config.algo == "reinforce":
             policy_loss = -(log_probs * advantages * mask_agents).sum() / n_steps
@@ -299,6 +430,34 @@ def ppo_update(
         ) / n_steps
 
         loss = policy_loss - entropy_bonus
+
+        if train_config.signaling_coef > 0.0:
+            # Group the MI estimate by which agent held each attribute this
+            # episode (fixed assignment reduces to the old per-role grouping).
+            batch_index = torch.arange(message_probs.shape[0], device=device)
+            holder = batch["color_holder"]
+            color_probs = message_probs[batch_index, :, holder, :]
+            region_probs = message_probs[batch_index, :, 1 - holder, :]
+            signaling_mi = clue_message_mi(
+                color_probs, batch["clues"][:, 0], mask, env_config.n_colors
+            ) + clue_message_mi(
+                region_probs, batch["clues"][:, 1], mask, env_config.n_regions
+            )
+            loss = loss - train_config.signaling_coef * signaling_mi
+            totals["signaling_mi_bits"] += float(signaling_mi.item()) / float(np.log(2))
+
+        if train_config.listening_coef > 0.0:
+            muted = batch["observations"].clone()
+            muted[..., message_slice] = 0.0
+            muted[..., message_slice.start] = 1.0  # one-hot silence
+            _, _, _, muted_move_probs, _ = sequence_forward(
+                actors, muted, batch["moves"], batch["messages"], device
+            )
+            divergence = (move_probs - muted_move_probs).abs().sum(-1)  # [B, T, 2]
+            listening = (divergence * mask_agents).sum() / n_steps
+            loss = loss - train_config.listening_coef * listening
+            totals["listening_l1"] += float(listening.item())
+
         if returns is not None:
             new_values = torch.stack(
                 [critic(batch["states"]) for critic in critics], dim=-1
@@ -309,7 +468,8 @@ def ppo_update(
 
         optimizer.zero_grad()
         loss.backward()
-        parameters = list(actor.parameters()) + list(critics.parameters())
+        parameters = [p for actor in dict.fromkeys(actors) for p in actor.parameters()]
+        parameters += list(critics.parameters())
         torch.nn.utils.clip_grad_norm_(parameters, train_config.max_grad_norm)
         optimizer.step()
 
@@ -320,6 +480,8 @@ def ppo_update(
 
     averaged = {key: value / epochs for key, value in totals.items()}
     averaged.setdefault("value_loss", 0.0)
+    averaged.setdefault("signaling_mi_bits", 0.0)
+    averaged.setdefault("listening_l1", 0.0)
     return averaged
 
 
@@ -341,6 +503,19 @@ def main() -> None:
     parser.add_argument("--algo", choices=("ppo", "reinforce"), default="ppo")
     parser.add_argument("--hare-reward", type=float, default=2.0)
     parser.add_argument("--commit-window", type=int, default=0)
+    parser.add_argument("--n-hares", type=int, default=2)
+    parser.add_argument("--capture-mode", choices=("interact", "presence"), default="interact")
+    parser.add_argument("--hide-other-position", action="store_true")
+    parser.add_argument("--horizon", type=int, default=30)
+    parser.add_argument("--sticky-messages", action="store_true")
+    parser.add_argument("--talk-phase-steps", type=int, default=0)
+    parser.add_argument("--signaling-coef", type=float, default=0.0)
+    parser.add_argument("--listening-coef", type=float, default=0.0)
+    parser.add_argument("--separate-actors", action="store_true")
+    parser.add_argument("--randomize-clues", action="store_true")
+    parser.add_argument("--n-colors", type=int, default=2)
+    parser.add_argument("--n-regions", type=int, default=2)
+    parser.add_argument("--vocab-size", type=int, default=4)
     args = parser.parse_args()
 
     train_config = TrainConfig(
@@ -356,18 +531,42 @@ def main() -> None:
         proximity_updates=args.proximity_updates,
         message_entropy_coef=args.message_entropy_coef,
         algo=args.algo,
+        signaling_coef=args.signaling_coef,
+        listening_coef=args.listening_coef,
+        separate_actors=args.separate_actors,
     )
     device = torch.device(resolve_torch_device(train_config.device))
     torch.manual_seed(train_config.seed)
 
-    env_config = EnvConfig(hare_reward=args.hare_reward, commit_window=args.commit_window)
-    env = StagHuntLanguageEnv(env_config)
-    actor = RecurrentActor(env_config, hidden_size=train_config.hidden_size).to(device)
+    env_config = EnvConfig(
+        hare_reward=args.hare_reward,
+        commit_window=args.commit_window,
+        n_hares=args.n_hares,
+        capture_mode=args.capture_mode,
+        observe_other_position=not args.hide_other_position,
+        horizon=args.horizon,
+        sticky_messages=args.sticky_messages,
+        talk_phase_steps=args.talk_phase_steps,
+        randomize_clue_assignment=args.randomize_clues,
+        n_colors=args.n_colors,
+        n_regions=args.n_regions,
+        vocab_size=args.vocab_size,
+    )
+    envs = [StagHuntLanguageEnv(env_config) for _ in range(train_config.episodes_per_update)]
+    if train_config.separate_actors:
+        actors = [
+            RecurrentActor(env_config, hidden_size=train_config.hidden_size).to(device)
+            for _ in AGENTS
+        ]
+    else:
+        shared = RecurrentActor(env_config, hidden_size=train_config.hidden_size).to(device)
+        actors = [shared, shared]
     critics = nn.ModuleList(
         [CentralizedCritic(env_config, hidden_size=train_config.hidden_size) for _ in AGENTS]
     ).to(device)
+    actor_parameters = [p for actor in dict.fromkeys(actors) for p in actor.parameters()]
     optimizer = torch.optim.Adam(
-        list(actor.parameters()) + list(critics.parameters()),
+        actor_parameters + list(critics.parameters()),
         lr=train_config.learning_rate,
     )
 
@@ -394,10 +593,12 @@ def main() -> None:
                 + env_config.failed_stag_reward * progress,
                 6,
             )
-            if failed_stag_reward != env.config.failed_stag_reward:
-                env = StagHuntLanguageEnv(
-                    replace(env_config, failed_stag_reward=failed_stag_reward)
-                )
+            if failed_stag_reward != envs[0].config.failed_stag_reward:
+                shifted = replace(env_config, failed_stag_reward=failed_stag_reward)
+                envs = [
+                    StagHuntLanguageEnv(shifted)
+                    for _ in range(train_config.episodes_per_update)
+                ]
 
         if train_config.proximity_updates > 0:
             proximity_progress = min(update / train_config.proximity_updates, 1.0)
@@ -405,23 +606,20 @@ def main() -> None:
         else:
             current_bonus = train_config.proximity_bonus
 
-        episodes = []
-        for _ in range(train_config.episodes_per_update):
-            episode_seed += 1
-            episodes.append(
-                collect_episode(
-                    env,
-                    actor,
-                    critics,
-                    env_config,
-                    device,
-                    episode_seed,
-                    proximity_bonus=current_bonus,
-                )
-            )
+        seeds = [episode_seed + 1 + offset for offset in range(train_config.episodes_per_update)]
+        episode_seed += train_config.episodes_per_update
+        episodes = collect_batch(
+            envs,
+            actors,
+            critics,
+            env_config,
+            device,
+            seeds,
+            proximity_bonus=current_bonus,
+        )
 
         batch = pad_episodes(episodes, device)
-        losses = ppo_update(actor, critics, optimizer, batch, train_config, device)
+        losses = ppo_update(actors, critics, optimizer, batch, train_config, env_config, device)
 
         outcomes = Counter(episode.outcome for episode in episodes)
         returns = np.array(
@@ -429,17 +627,33 @@ def main() -> None:
         )  # [B, 2]
         messages = torch.cat([episode.messages.reshape(-1) for episode in episodes])
         silence_rate = float((messages == 0).float().mean().item())
+        # One-shot targeting: of the episodes whose first joint stag presence
+        # happened at all, how many aimed at the correct stag first? Chance is
+        # 1/n_stags with independent clue-consistent guessing.
+        first_presences = Counter(
+            episode.first_joint_presence
+            for episode in episodes
+            if episode.first_joint_presence is not None
+        )
+        attempted = sum(first_presences.values())
 
         record = {
             "update": update,
             "elapsed_s": round(time.time() - start, 1),
-            "failed_stag_reward": env.config.failed_stag_reward,
+            "failed_stag_reward": envs[0].config.failed_stag_reward,
             "proximity_bonus": round(current_bonus, 6),
             "mean_return_agent_0": float(returns[:, 0].mean()),
             "mean_return_agent_1": float(returns[:, 1].mean()),
             "mean_length": float(np.mean([episode.length for episode in episodes])),
             "outcomes": dict(outcomes),
             "silence_rate": silence_rate,
+            "first_presence_counts": dict(first_presences),
+            "first_presence_accuracy": (
+                round(first_presences.get("correct", 0) / attempted, 4) if attempted else None
+            ),
+            "mean_wrong_presence_steps": float(
+                np.mean([episode.wrong_presence_steps for episode in episodes])
+            ),
             **{key: round(value, 4) for key, value in losses.items()},
         }
         metrics_file.write(json.dumps(record) + "\n")
@@ -453,9 +667,13 @@ def main() -> None:
             )
 
         if (update + 1) % args.checkpoint_every == 0 or update == train_config.updates - 1:
+            if train_config.separate_actors:
+                actor_state = {"actors": [actor.state_dict() for actor in actors]}
+            else:
+                actor_state = {"actor": actors[0].state_dict()}
             torch.save(
                 {
-                    "actor": actor.state_dict(),
+                    **actor_state,
                     "critics": critics.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "train_config": asdict(train_config),
