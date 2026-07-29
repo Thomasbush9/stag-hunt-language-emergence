@@ -381,3 +381,46 @@ def test_parallel_environment_api_presence_no_hares() -> None:
         StagHuntLanguageEnv(EnvConfig(capture_mode="presence", n_hares=0)),
         num_cycles=100,
     )
+
+
+def test_co_observation_reveals_both_attributes_and_varies() -> None:
+    env = StagHuntLanguageEnv(
+        EnvConfig(randomize_clue_assignment=True, co_observation_prob=0.5)
+    )
+    seen = set()
+    for seed in range(40):
+        observations, infos = env.reset(seed=seed)
+        co = infos["agent_0"]["co_observes"]
+        for agent, observation in observations.items():
+            color, region = observation["private_clue"]
+            if co[agent]:
+                # A co-observing agent sees both attributes itself.
+                assert color == env.correct_color + 1
+                assert region == env.correct_region + 1
+            elif agent == env.color_holder:
+                assert (color, region) == (env.correct_color + 1, 0)
+            else:
+                assert (color, region) == (0, env.correct_region + 1)
+            seen.add(co[agent])
+    # Both co-observing and blind episodes occur at p=0.5.
+    assert seen == {True, False}
+    # Two co-observation flags are appended to the global state.
+    assert env.state().shape[0] == 14 + 4 * env.config.n_stags + 2 * env.config.n_hares
+
+
+def test_co_observation_disabled_by_default() -> None:
+    env = StagHuntLanguageEnv(EnvConfig())
+    for seed in range(5):
+        observations, infos = env.reset(seed=seed)
+        assert infos["agent_0"]["co_observes"] == {"agent_0": False, "agent_1": False}
+        assert observations["agent_0"]["private_clue"][1] == 0
+        assert observations["agent_1"]["private_clue"][0] == 0
+    assert env.state().shape[0] == 11 + 4 * env.config.n_stags + 2 * env.config.n_hares
+
+
+def test_co_observation_prob_one_reveals_everything() -> None:
+    env = StagHuntLanguageEnv(EnvConfig(co_observation_prob=1.0))
+    observations, _ = env.reset(seed=0)
+    for observation in observations.values():
+        color, region = observation["private_clue"]
+        assert (color, region) == (env.correct_color + 1, env.correct_region + 1)

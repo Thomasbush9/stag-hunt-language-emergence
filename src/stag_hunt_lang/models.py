@@ -10,7 +10,11 @@ from torch.distributions import Categorical
 
 from stag_hunt_lang.config import EnvConfig
 from stag_hunt_lang.env import Move
-from stag_hunt_lang.observations import global_state_size, observation_vector_size
+from stag_hunt_lang.observations import (
+    global_state_size,
+    observation_vector_size,
+    received_message_slice,
+)
 
 
 @dataclass(slots=True)
@@ -25,12 +29,28 @@ class PolicyOutput:
 
 
 class RecurrentActor(nn.Module):
-    """A shared recurrent actor with separate move and message distributions."""
+    """A shared recurrent actor with separate move and message distributions.
 
-    def __init__(self, config: EnvConfig, hidden_size: int = 128) -> None:
+    With ``tied_symbols`` the same symbol-embedding matrix is used to produce
+    messages and to encode heard ones (as in tied input/output embeddings for
+    language models). Learning to *say* a symbol informatively then also moves
+    the representation used to *hear* it, so production and comprehension stop
+    being independent problems — a motor-theory-of-perception scaffold that
+    lives in the architecture rather than in the loss.
+    """
+
+    def __init__(
+        self,
+        config: EnvConfig,
+        hidden_size: int = 128,
+        *,
+        tied_symbols: bool = False,
+        symbol_dim: int = 32,
+    ) -> None:
         super().__init__()
         self.config = config
         self.hidden_size = hidden_size
+        self.tied_symbols = tied_symbols
         self.encoder = nn.Sequential(
             nn.Linear(observation_vector_size(config), hidden_size),
             nn.LayerNorm(hidden_size),
@@ -38,7 +58,31 @@ class RecurrentActor(nn.Module):
         )
         self.memory = nn.GRUCell(hidden_size, hidden_size)
         self.move_head = nn.Linear(hidden_size, len(Move))
-        self.message_head = nn.Linear(hidden_size, config.vocab_size + 1)
+        if tied_symbols:
+            self.message_slice = received_message_slice(config)
+            self.symbol_embedding = nn.Parameter(
+                torch.randn(config.vocab_size + 1, symbol_dim) * 0.1
+            )
+            self.speak_projection = nn.Linear(hidden_size, symbol_dim)
+            self.hear_projection = nn.Linear(symbol_dim, hidden_size)
+            self.message_bias = nn.Parameter(torch.zeros(config.vocab_size + 1))
+        else:
+            self.message_head = nn.Linear(hidden_size, config.vocab_size + 1)
+
+    def _encode(self, observations: torch.Tensor) -> torch.Tensor:
+        """Encode observations, routing heard symbols through the tied embedding."""
+
+        if not self.tied_symbols:
+            return self.encoder(observations)
+        heard = observations[..., self.message_slice]
+        masked = observations.clone()
+        masked[..., self.message_slice] = 0.0
+        return self.encoder(masked) + self.hear_projection(heard @ self.symbol_embedding)
+
+    def _message_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        if not self.tied_symbols:
+            return self.message_head(hidden)
+        return self.speak_projection(hidden) @ self.symbol_embedding.t() + self.message_bias
 
     def initial_state(
         self, batch_size: int, *, device: str | torch.device | None = None
@@ -50,11 +94,11 @@ class RecurrentActor(nn.Module):
     def distributions(
         self, observations: torch.Tensor, hidden: torch.Tensor
     ) -> tuple[Categorical, Categorical, torch.Tensor]:
-        encoded = self.encoder(observations)
+        encoded = self._encode(observations)
         next_hidden = self.memory(encoded, hidden)
         return (
             Categorical(logits=self.move_head(next_hidden)),
-            Categorical(logits=self.message_head(next_hidden)),
+            Categorical(logits=self._message_logits(next_hidden)),
             next_hidden,
         )
 

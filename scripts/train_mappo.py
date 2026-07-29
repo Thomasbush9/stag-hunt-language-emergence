@@ -67,6 +67,7 @@ class TrainConfig:
     listening_coef: float = 0.0
     # Decoupled agents: one RecurrentActor per agent instead of shared weights.
     separate_actors: bool = False
+    tied_symbols: bool = False
 
 
 @dataclass(slots=True)
@@ -517,6 +518,8 @@ def main() -> None:
     parser.add_argument("--n-regions", type=int, default=2)
     parser.add_argument("--vocab-size", type=int, default=4)
     parser.add_argument("--init-checkpoint", type=Path, default=None)
+    parser.add_argument("--co-observation-prob", type=float, default=0.0)
+    parser.add_argument("--tied-symbols", action="store_true")
     args = parser.parse_args()
 
     train_config = TrainConfig(
@@ -535,6 +538,7 @@ def main() -> None:
         signaling_coef=args.signaling_coef,
         listening_coef=args.listening_coef,
         separate_actors=args.separate_actors,
+        tied_symbols=args.tied_symbols,
     )
     device = torch.device(resolve_torch_device(train_config.device))
     torch.manual_seed(train_config.seed)
@@ -552,15 +556,20 @@ def main() -> None:
         n_colors=args.n_colors,
         n_regions=args.n_regions,
         vocab_size=args.vocab_size,
+        co_observation_prob=args.co_observation_prob,
     )
     envs = [StagHuntLanguageEnv(env_config) for _ in range(train_config.episodes_per_update)]
+    def build_actor() -> RecurrentActor:
+        return RecurrentActor(
+            env_config,
+            hidden_size=train_config.hidden_size,
+            tied_symbols=train_config.tied_symbols,
+        ).to(device)
+
     if train_config.separate_actors:
-        actors = [
-            RecurrentActor(env_config, hidden_size=train_config.hidden_size).to(device)
-            for _ in AGENTS
-        ]
+        actors = [build_actor() for _ in AGENTS]
     else:
-        shared = RecurrentActor(env_config, hidden_size=train_config.hidden_size).to(device)
+        shared = build_actor()
         actors = [shared, shared]
     critics = nn.ModuleList(
         [CentralizedCritic(env_config, hidden_size=train_config.hidden_size) for _ in AGENTS]

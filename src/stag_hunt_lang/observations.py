@@ -101,6 +101,7 @@ def global_state_size(config: EnvConfig) -> int:
         + 4 * config.n_stags
         + 2 * config.n_hares
         + (1 if config.randomize_clue_assignment else 0)
+        + (2 if config.co_observation_prob > 0.0 else 0)
     )
 
 

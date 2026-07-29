@@ -45,6 +45,13 @@ class EnvConfig:
     # marks the held attribute, so no observation format change is needed.
     # Forces every agent to learn all four speak/decode mappings.
     randomize_clue_assignment: bool = False
+    # Stochastic observability: per episode, each agent independently sees BOTH
+    # attributes with this probability instead of only its own clue. Naturalistic
+    # (perception is sometimes sufficient, sometimes not) and it supplies the
+    # gradient the speaker otherwise lacks: in co-observed episodes a listener
+    # can ground the partner's symbols against its own view rather than against
+    # rare capture reward. 0 disables (the standard blind game).
+    co_observation_prob: float = 0.0
 
     def __post_init__(self) -> None:
         if self.grid_size < 3:
@@ -67,6 +74,8 @@ class EnvConfig:
             raise ValueError("commit_window is only meaningful with capture_mode='interact'")
         if not 0 <= self.talk_phase_steps < self.horizon:
             raise ValueError("talk_phase_steps must be in [0, horizon)")
+        if not 0.0 <= self.co_observation_prob <= 1.0:
+            raise ValueError("co_observation_prob must be in [0, 1]")
         if not self.stag_reward > self.failed_stag_reward:
             raise ValueError("payoffs must satisfy stag_reward > failed_stag_reward")
         if self.n_hares > 0 and not self.stag_reward > self.hare_reward > self.failed_stag_reward:

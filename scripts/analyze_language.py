@@ -35,9 +35,12 @@ def load_actors(path: Path, env_config: EnvConfig, device: torch.device) -> list
 
     checkpoint = torch.load(path, map_location=device, weights_only=True)
     hidden_size = checkpoint["train_config"]["hidden_size"]
+    tied_symbols = checkpoint["train_config"].get("tied_symbols", False)
 
     def build(state_dict: dict) -> RecurrentActor:
-        actor = RecurrentActor(env_config, hidden_size=hidden_size).to(device)
+        actor = RecurrentActor(
+            env_config, hidden_size=hidden_size, tied_symbols=tied_symbols
+        ).to(device)
         actor.load_state_dict(state_dict)
         actor.eval()
         return actor

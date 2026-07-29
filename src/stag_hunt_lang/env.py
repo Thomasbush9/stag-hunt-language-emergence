@@ -84,6 +84,9 @@ class StagHuntLanguageEnv(ParallelEnv):
         self._first_joint_presence: str | None = None
         self._wrong_presence_steps = 0
         self._color_holder: AgentID = "agent_0"
+        self._co_observes: dict[AgentID, bool] = {
+            agent: False for agent in self.possible_agents
+        }
         self._observation_spaces = {
             agent: self._make_observation_space() for agent in self.possible_agents
         }
@@ -175,6 +178,13 @@ class StagHuntLanguageEnv(ParallelEnv):
             self._color_holder = self.possible_agents[int(self.np_random.integers(2))]
         else:
             self._color_holder = "agent_0"
+        # Stochastic observability: an agent that co-observes this episode sees
+        # both attributes itself, so it can ground its partner's messages
+        # against its own view instead of against rare capture reward.
+        self._co_observes = {
+            agent: bool(self.np_random.random() < self.config.co_observation_prob)
+            for agent in self.possible_agents
+        }
 
         self._correct_color = self._sample_feature(
             options.get("correct_color"), self.config.n_colors, "correct_color"
@@ -314,6 +324,13 @@ class StagHuntLanguageEnv(ParallelEnv):
         if self.config.randomize_clue_assignment:
             components.append(
                 np.asarray([self.possible_agents.index(self._color_holder)], dtype=np.int64)
+            )
+        if self.config.co_observation_prob > 0.0:
+            components.append(
+                np.asarray(
+                    [self._co_observes[agent] for agent in self.possible_agents],
+                    dtype=np.int64,
+                )
             )
         return np.concatenate(components).astype(np.float32)
 
@@ -565,10 +582,10 @@ class StagHuntLanguageEnv(ParallelEnv):
             if self.config.observe_other_position
             else np.asarray([-1, -1], dtype=np.int64)
         )
-        if agent == self._color_holder:
-            private_clue = np.asarray([self._correct_color + 1, 0], dtype=np.int64)
-        else:
-            private_clue = np.asarray([0, self._correct_region + 1], dtype=np.int64)
+        holds_color = agent == self._color_holder
+        color = self._correct_color + 1 if holds_color or self._co_observes[agent] else 0
+        region = self._correct_region + 1 if not holds_color or self._co_observes[agent] else 0
+        private_clue = np.asarray([color, region], dtype=np.int64)
 
         return {
             "agent_id": self.possible_agents.index(agent),
@@ -593,6 +610,7 @@ class StagHuntLanguageEnv(ParallelEnv):
             "first_joint_presence": self._first_joint_presence,
             "wrong_presence_steps": self._wrong_presence_steps,
             "color_holder": self._color_holder,
+            "co_observes": dict(self._co_observes),
         }
 
     def _parse_action(self, agent: AgentID, action: dict[str, int]) -> tuple[Move, int]:
