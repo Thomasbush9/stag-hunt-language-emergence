@@ -519,6 +519,8 @@ def main() -> None:
     parser.add_argument("--vocab-size", type=int, default=4)
     parser.add_argument("--init-checkpoint", type=Path, default=None)
     parser.add_argument("--co-observation-prob", type=float, default=0.0)
+    parser.add_argument("--co-observation-mode", choices=("private", "shared"), default="private")
+    parser.add_argument("--solo-presence-reward", type=float, default=0.0)
     parser.add_argument("--tied-symbols", action="store_true")
     args = parser.parse_args()
 
@@ -557,6 +559,8 @@ def main() -> None:
         n_regions=args.n_regions,
         vocab_size=args.vocab_size,
         co_observation_prob=args.co_observation_prob,
+        co_observation_mode=args.co_observation_mode,
+        solo_presence_reward=args.solo_presence_reward,
     )
     envs = [StagHuntLanguageEnv(env_config) for _ in range(train_config.episodes_per_update)]
     def build_actor() -> RecurrentActor:

@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+import pytest
 from pettingzoo.test import parallel_api_test
 
 from stag_hunt_lang import EnvConfig, Move, StagHuntLanguageEnv
@@ -424,3 +425,74 @@ def test_co_observation_prob_one_reveals_everything() -> None:
     for observation in observations.values():
         color, region = observation["private_clue"]
         assert (color, region) == (env.correct_color + 1, env.correct_region + 1)
+
+
+def test_shared_fog_makes_visibility_common_knowledge() -> None:
+    env = StagHuntLanguageEnv(
+        EnvConfig(
+            randomize_clue_assignment=True,
+            co_observation_prob=0.5,
+            co_observation_mode="shared",
+        )
+    )
+    conditions = set()
+    for seed in range(40):
+        observations, infos = env.reset(seed=seed)
+        co = infos["agent_0"]["co_observes"]
+        # Both agents always share the same visibility condition.
+        assert co["agent_0"] == co["agent_1"]
+        conditions.add(co["agent_0"])
+        for observation in observations.values():
+            color, region = observation["private_clue"]
+            if co["agent_0"]:
+                assert (color, region) == (env.correct_color + 1, env.correct_region + 1)
+            else:
+                assert (color == 0) != (region == 0)
+    assert conditions == {True, False}
+
+
+def test_private_mode_still_draws_independently() -> None:
+    env = StagHuntLanguageEnv(
+        EnvConfig(co_observation_prob=0.5, co_observation_mode="private")
+    )
+    disagreements = 0
+    for seed in range(60):
+        _, infos = env.reset(seed=seed)
+        co = infos["agent_0"]["co_observes"]
+        disagreements += co["agent_0"] != co["agent_1"]
+    assert disagreements > 0
+
+
+def test_solo_presence_reward_paid_once_per_agent() -> None:
+    config = EnvConfig(
+        capture_mode="presence", n_hares=0, solo_presence_reward=0.5, horizon=20
+    )
+    env = StagHuntLanguageEnv(config)
+    env.reset(seed=3)
+    target = env.correct_target_position.copy()
+    # Park agent_0 on the correct stag alone; agent_1 stays elsewhere.
+    env._agent_positions["agent_0"] = target.copy()
+    other = np.asarray([0, 0], dtype=np.int64)
+    if np.array_equal(other, target):
+        other = np.asarray([config.grid_size - 1, config.grid_size - 1], dtype=np.int64)
+    env._agent_positions["agent_1"] = other
+
+    totals = []
+    for _ in range(3):
+        rewards = {agent: 0.0 for agent in env.possible_agents}
+        env._resolve_presence(rewards)
+        totals.append(rewards["agent_0"])
+    # Paid on the first step of solo presence, never again.
+    assert totals[0] == 0.5
+    assert totals[1:] == [0.0, 0.0]
+
+
+def test_solo_presence_reward_defaults_off_and_is_bounded() -> None:
+    env = StagHuntLanguageEnv(EnvConfig(capture_mode="presence", n_hares=0))
+    env.reset(seed=0)
+    rewards = {agent: 0.0 for agent in env.possible_agents}
+    env._agent_positions["agent_0"] = env.correct_target_position.copy()
+    env._resolve_presence(rewards)
+    assert rewards["agent_0"] == 0.0
+    with pytest.raises(ValueError, match="solo_presence_reward"):
+        EnvConfig(solo_presence_reward=2.0)

@@ -52,6 +52,18 @@ class EnvConfig:
     # can ground the partner's symbols against its own view rather than against
     # rare capture reward. 0 disables (the standard blind game).
     co_observation_prob: float = 0.0
+    # "private": each agent draws co-observation independently, so an informed
+    # agent cannot tell whether its partner is informed too. Measured 2026-07-29
+    # to bootstrap nothing — private knowledge is not common knowledge, and in a
+    # game that pays only for joint presence, acting on it is a losing gamble.
+    # "shared": one draw per episode ("clear" vs "foggy"), so visibility is
+    # identical for both agents and hence common knowledge.
+    co_observation_mode: str = "private"
+    # Small payoff for standing alone on the correct stag, once per episode per
+    # agent. Gives "use the target information I hold" a gradient of its own,
+    # which joint-only capture reward never provides. Must stay well below
+    # stag_reward or solo scouting displaces cooperation.
+    solo_presence_reward: float = 0.0
 
     def __post_init__(self) -> None:
         if self.grid_size < 3:
@@ -76,6 +88,15 @@ class EnvConfig:
             raise ValueError("talk_phase_steps must be in [0, horizon)")
         if not 0.0 <= self.co_observation_prob <= 1.0:
             raise ValueError("co_observation_prob must be in [0, 1]")
+        if self.co_observation_mode not in ("private", "shared"):
+            raise ValueError("co_observation_mode must be 'private' or 'shared'")
+        if self.solo_presence_reward < 0:
+            raise ValueError("solo_presence_reward must be non-negative")
+        if self.solo_presence_reward >= self.stag_reward / 2:
+            raise ValueError(
+                "solo_presence_reward must stay well below stag_reward/2, "
+                "otherwise solo scouting dominates cooperation"
+            )
         if not self.stag_reward > self.failed_stag_reward:
             raise ValueError("payoffs must satisfy stag_reward > failed_stag_reward")
         if self.n_hares > 0 and not self.stag_reward > self.hare_reward > self.failed_stag_reward:

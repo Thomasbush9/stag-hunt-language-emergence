@@ -87,6 +87,7 @@ class StagHuntLanguageEnv(ParallelEnv):
         self._co_observes: dict[AgentID, bool] = {
             agent: False for agent in self.possible_agents
         }
+        self._solo_rewarded: set[AgentID] = set()
         self._observation_spaces = {
             agent: self._make_observation_space() for agent in self.possible_agents
         }
@@ -178,13 +179,21 @@ class StagHuntLanguageEnv(ParallelEnv):
             self._color_holder = self.possible_agents[int(self.np_random.integers(2))]
         else:
             self._color_holder = "agent_0"
-        # Stochastic observability: an agent that co-observes this episode sees
-        # both attributes itself, so it can ground its partner's messages
-        # against its own view instead of against rare capture reward.
-        self._co_observes = {
-            agent: bool(self.np_random.random() < self.config.co_observation_prob)
-            for agent in self.possible_agents
-        }
+        # Stochastic observability. In "private" mode each agent independently
+        # co-observes, so an informed agent cannot tell whether its partner is
+        # also informed — private knowledge, never common knowledge, which is
+        # why it failed to bootstrap anything. In "shared" mode the draw is
+        # per EPISODE ("clear" vs "foggy" weather): visibility is the same for
+        # both agents and therefore common knowledge.
+        if self.config.co_observation_mode == "shared":
+            clear = bool(self.np_random.random() < self.config.co_observation_prob)
+            self._co_observes = {agent: clear for agent in self.possible_agents}
+        else:
+            self._co_observes = {
+                agent: bool(self.np_random.random() < self.config.co_observation_prob)
+                for agent in self.possible_agents
+            }
+        self._solo_rewarded: set[AgentID] = set()
 
         self._correct_color = self._sample_feature(
             options.get("correct_color"), self.config.n_colors, "correct_color"
@@ -486,6 +495,19 @@ class StagHuntLanguageEnv(ParallelEnv):
 
         positions = [self._agent_positions[agent] for agent in self.possible_agents]
         if not all(np.array_equal(positions[0], later) for later in positions[1:]):
+            # Solo scouting payoff: an agent alone on the correct stag earns a
+            # small reward, once per episode. Without it, using target
+            # information you already hold has no gradient of its own — capture
+            # needs both bodies, so a lone informed agent earns nothing.
+            if self.config.solo_presence_reward:
+                for agent in self.possible_agents:
+                    if agent in self._solo_rewarded:
+                        continue
+                    if np.array_equal(
+                        self._agent_positions[agent], self.correct_target_position
+                    ):
+                        rewards[agent] += self.config.solo_presence_reward
+                        self._solo_rewarded.add(agent)
             return False
         shared_cell = positions[0]
         if not self._position_in(shared_cell, self._stag_positions):
