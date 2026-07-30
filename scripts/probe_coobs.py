@@ -22,9 +22,21 @@ from stag_hunt_lang.observations import batch_observations
 
 AGENTS = ("agent_0", "agent_1")
 
+
+def resolve_run(name: str) -> Path:
+    """Find a run directory whether it is still at the top level or filed
+    into a dated experiment folder."""
+    direct = FILES / name
+    if direct.is_dir():
+        return direct
+    matches = sorted(FILES.glob(f"*/{name}"))
+    if not matches:
+        raise SystemExit(f"run directory not found: {name}")
+    return matches[-1]
+
 def run(name, episodes=600):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ck = sorted((FILES / name).glob("checkpoint_*.pt"))[-1]
+    ck = sorted(resolve_run(name).glob("checkpoint_*.pt"))[-1]
     cfg = analyze.load_env_config(ck, device)
     actors = analyze.load_actors(ck, cfg, device)
     env = StagHuntLanguageEnv(cfg)

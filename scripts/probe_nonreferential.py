@@ -30,6 +30,18 @@ from stag_hunt_lang.observations import batch_observations  # noqa: E402
 AGENTS = ("agent_0", "agent_1")
 
 
+def resolve_run(name: str) -> Path:
+    """Find a run directory whether it is still at the top level or filed
+    into a dated experiment folder."""
+    direct = FILES / name
+    if direct.is_dir():
+        return direct
+    matches = sorted(FILES.glob(f"*/{name}"))
+    if not matches:
+        raise SystemExit(f"run directory not found: {name}")
+    return matches[-1]
+
+
 def mi_bits(joint: np.ndarray) -> float:
     """Mutual information of a joint count table, in bits."""
     total = joint.sum()
@@ -45,7 +57,7 @@ def mi_bits(joint: np.ndarray) -> float:
 
 def probe(run: str, episodes: int = 400) -> dict:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    checkpoints = sorted((FILES / run).glob("checkpoint_*.pt"))
+    checkpoints = sorted(resolve_run(run).glob("checkpoint_*.pt"))
     env_config = analyze.load_env_config(checkpoints[-1], device)
     actors = analyze.load_actors(checkpoints[-1], env_config, device)
     env = StagHuntLanguageEnv(env_config)
