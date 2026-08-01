@@ -503,6 +503,7 @@ def main() -> None:
     parser.add_argument("--message-entropy-coef", type=float, default=None)
     parser.add_argument("--algo", choices=("ppo", "reinforce"), default="ppo")
     parser.add_argument("--hare-reward", type=float, default=2.0)
+    parser.add_argument("--failed-stag-reward", type=float, default=0.0)
     parser.add_argument("--commit-window", type=int, default=0)
     parser.add_argument("--n-hares", type=int, default=2)
     parser.add_argument("--capture-mode", choices=("interact", "presence"), default="interact")
@@ -547,6 +548,7 @@ def main() -> None:
 
     env_config = EnvConfig(
         hare_reward=args.hare_reward,
+        failed_stag_reward=args.failed_stag_reward,
         commit_window=args.commit_window,
         n_hares=args.n_hares,
         capture_mode=args.capture_mode,
